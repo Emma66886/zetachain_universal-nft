@@ -142,13 +142,18 @@ pub mod connected {
     }
 
     /// Handle incoming cross-chain calls from ZetaChain
+    /// Official signature from ZetaChain documentation
     pub fn on_call(
         ctx: Context<OnCall>,
+        amount: u64,
         sender: [u8; 20],
-        message: Vec<u8>,
+        data: Vec<u8>,
     ) -> Result<()> {
+        // Use amount parameter to track the deposited amount
+        msg!("Received cross-chain call with amount: {}", amount);
+        
         // Decode the NFT transfer data
-        let transfer_data = CrossChainNFTTransfer::try_from_slice(&message)
+        let transfer_data = CrossChainNFTTransfer::try_from_slice(&data)
             .map_err(|_| ErrorCode::DecodingError)?;
 
         // Mint the NFT on Solana
@@ -177,6 +182,43 @@ pub mod connected {
             symbol: transfer_data.symbol,
             uri: transfer_data.uri,
         });
+
+        Ok(())
+    }
+
+    /// Handle transaction reverts from ZetaChain
+    /// Official signature from ZetaChain documentation
+    pub fn on_revert(
+        ctx: Context<OnRevert>,
+        amount: u64,        // Asset quantity originally deposited (lamports or SPL)
+        sender: Pubkey,     // The account that triggered the deposit/call from Solana
+        data: Vec<u8>,      // Arbitrary bytes supplied via revert_message
+    ) -> Result<()> {
+        // Handle the revert scenario
+        // This could involve refunding tokens, updating state, or emitting events
+        
+        msg!("Cross-chain transaction reverted for PDA: {}", ctx.accounts.pda.key());
+        msg!("Original sender: {}", sender);
+        msg!("Reverted amount: {}", amount);
+        
+        // Use the amount parameter to avoid warnings
+        let _reverted_amount = amount;
+        
+        // Attempt to decode the original transfer data if possible
+        if let Ok(transfer_data) = CrossChainNFTTransfer::try_from_slice(&data) {
+            msg!("Reverted NFT transfer for token_id: {}", transfer_data.token_id);
+            
+            // You could implement logic here to:
+            // - Restore the burned NFT
+            // - Refund any associated tokens
+            // - Update application state
+            
+            emit!(CrossChainTransferReverted {
+                token_id: transfer_data.token_id,
+                original_sender: sender,
+                reverted_amount: _reverted_amount,
+            });
+        }
 
         Ok(())
     }
@@ -297,12 +339,12 @@ fn decode_nft_transfer(data: &[u8]) -> Result<CrossChainNFTTransfer> {
         let gateway_instruction_data = GatewayCallInstruction {
             receiver: destination_receiver,
             message: encoded_data,
-            gas_limit: gas_amount,
             revert_options: Some(RevertOptions {
                 revert_address: ctx.accounts.signer.key(),
+                abort_address: destination_receiver, // Use destination as abort address
                 call_on_revert: true,
-                abort_address: ctx.accounts.signer.key(),
                 revert_message: b"NFT transfer failed".to_vec(),
+                on_revert_gas_limit: gas_amount,
             }),
         };
 
@@ -361,16 +403,17 @@ fn decode_nft_transfer(data: &[u8]) -> Result<CrossChainNFTTransfer> {
 pub struct GatewayCallInstruction {
     pub receiver: [u8; 20],
     pub message: Vec<u8>,
-    pub gas_limit: u64,
     pub revert_options: Option<RevertOptions>,
 }
 
+// Official ZetaChain RevertOptions struct from documentation
 #[derive(BorshSerialize, BorshDeserialize)]
 pub struct RevertOptions {
     pub revert_address: Pubkey,
+    pub abort_address: [u8; 20],
     pub call_on_revert: bool,
-    pub abort_address: Pubkey,
     pub revert_message: Vec<u8>,
+    pub on_revert_gas_limit: u64,
 }
 
 // Account contexts
@@ -539,6 +582,17 @@ pub struct OnCall<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct OnRevert<'info> {
+    #[account(mut, seeds = [b"connected"], bump)]
+    pub pda: Account<'info, Pda>,
+
+    #[account(mut)]
+    pub signer: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // Account data structures
 
 #[account]
@@ -630,6 +684,13 @@ pub struct CrossChainTransferReceived {
     pub name: String,
     pub symbol: String,
     pub uri: String,
+}
+
+#[event]
+pub struct CrossChainTransferReverted {
+    pub token_id: u64,
+    pub original_sender: Pubkey,
+    pub reverted_amount: u64,
 }
 
 // Error codes
