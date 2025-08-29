@@ -9,7 +9,7 @@ import { getHardhatConfig } from "@zetachain/toolkit/utils";
 dotenv.config();
 
 const config: HardhatUserConfig = {
-  ...getHardhatConfig({ accounts: [process.env.PRIVATE_KEY || ""] }),
+  ...getHardhatConfig({ accounts: [process.env.PRIVATE_KEY || ""], }),
 };
 
 export default config;

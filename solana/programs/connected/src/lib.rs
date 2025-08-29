@@ -1,16 +1,13 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::{
-    instruction::{AccountMeta, Instruction},
-    program::invoke,
-};
+use anchor_lang::solana_program::sysvar::instructions;
 use std::mem::size_of;
-use anchor_spl::token::{Mint, Token, TokenAccount, MintTo, mint_to, Burn, burn};
-use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::metadata::{
-    create_metadata_accounts_v3, CreateMetadataAccountsV3, Metadata,
+use anchor_spl::{
+    token::{self, Mint, Token, TokenAccount, MintTo, mint_to, Burn, burn},
+    associated_token::AssociatedToken,
+    metadata::{create_metadata_accounts_v3, CreateMetadataAccountsV3, Metadata},
 };
 use mpl_token_metadata::types::DataV2;
-use borsh::{BorshDeserialize, BorshSerialize};
+use gateway::{self, RevertOptions};
 
 declare_id!("9BjVGjn28E58LgSi547JYEpqpgRoo1TErkbyXiRSNDQy");
 
@@ -153,7 +150,7 @@ pub mod connected {
         msg!("Received cross-chain call with amount: {}", amount);
         
         // Decode the NFT transfer data
-        let transfer_data = CrossChainNFTTransfer::try_from_slice(&data)
+        let transfer_data = CrossChainNFTTransfer::deserialize(&mut &data[..])
             .map_err(|_| ErrorCode::DecodingError)?;
 
         // Mint the NFT on Solana
@@ -205,7 +202,7 @@ pub mod connected {
         let _reverted_amount = amount;
         
         // Attempt to decode the original transfer data if possible
-        if let Ok(transfer_data) = CrossChainNFTTransfer::try_from_slice(&data) {
+        if let Ok(transfer_data) = CrossChainNFTTransfer::deserialize(&mut &data[..]) {
             msg!("Reverted NFT transfer for token_id: {}", transfer_data.token_id);
             
             // You could implement logic here to:
@@ -226,194 +223,156 @@ pub mod connected {
 
 // Helper function to decode NFT transfer data
 fn decode_nft_transfer(data: &[u8]) -> Result<CrossChainNFTTransfer> {
-    CrossChainNFTTransfer::try_from_slice(data).map_err(|_| ErrorCode::DecodingError.into())
+    CrossChainNFTTransfer::deserialize(&mut &data[..]).map_err(|_| ErrorCode::DecodingError.into())
 }
-    pub fn on_call(
-        ctx: Context<OnCall>,
-        amount: u64,
-        sender: [u8; 20],
-        data: Vec<u8>,
-    ) -> Result<()> {
-        let pda = &mut ctx.accounts.pda;
 
-        // Store the sender's public key
-        pda.last_sender = sender;
-
-        // Try to decode NFT transfer data
-        match decode_nft_transfer(&data) {
-            Ok(nft_transfer) => {
-                // Handle NFT transfer
-                let nft_info = &mut ctx.accounts.nft_info;
-                
-                nft_info.token_id = nft_transfer.token_id;
-                nft_info.name = nft_transfer.name.clone();
-                nft_info.symbol = nft_transfer.symbol.clone();
-                nft_info.uri = nft_transfer.uri.clone();
-                nft_info.owner = nft_transfer.receiver;
-                nft_info.is_burned = false;
-                nft_info.mint = ctx.accounts.mint_account.key();
-
-                // Mint the NFT on Solana
-                let cpi_accounts = MintTo {
-                    mint: ctx.accounts.mint_account.to_account_info(),
-                    to: ctx.accounts.pda_ata.to_account_info(),
-                    authority: ctx.accounts.pda.to_account_info(),
-                };
-                let cpi_program = ctx.accounts.token_program.to_account_info();
-                
-                let seeds = &[b"connected".as_ref(), &[ctx.bumps.pda]];
-                let signer = &[&seeds[..]];
-                let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-                
-                mint_to(cpi_ctx, 1)?;
-
-                emit!(NFTReceived {
-                    token_id: nft_transfer.token_id,
-                    owner: nft_transfer.receiver,
-                    uri: nft_transfer.uri.clone(),
-                    from_chain: String::from_utf8_lossy(&nft_transfer.source_chain).to_string(),
-                });
-
-                msg!(
-                    "NFT transfer executed: token_id {}, receiver {:?}",
-                    nft_transfer.token_id,
-                    nft_transfer.receiver
-                );
-            }
-            Err(_) => {
-                // Fallback to regular message handling
-                let message = String::from_utf8(data).map_err(|_| ErrorCode::InvalidDataFormat)?;
-                pda.last_message = message;
-
-                if pda.last_message == "sol" {
-                    msg!(
-                        "On call sol executed with amount {}, sender {:?} and message {}",
-                        amount,
-                        pda.last_sender,
-                        pda.last_message
-                    );
-                } else {
-                    msg!(
-                        "On call spl executed with amount {}, spl {:?}, sender {:?} and message {}",
-                        amount,
-                        ctx.accounts.mint_account,
-                        pda.last_sender,
-                        pda.last_message
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Transfer NFT to another chain via ZetaChain Gateway
+    /// Transfer NFT cross-chain using ZetaChain Gateway
     pub fn transfer_cross_chain(
         ctx: Context<TransferCrossChain>,
         token_id: u64,
-        destination_chain: String,
-        destination_receiver: [u8; 20], // ZetaChain EVM address format
-        gas_amount: u64,
+        recipient_address: [u8; 20], // Ethereum address on destination chain
+        destination_chain_id: u64,
+        metadata_uri: String,
     ) -> Result<()> {
-        let nft_info = &ctx.accounts.nft_info;
+        msg!("Starting cross-chain NFT transfer");
         
-        // Verify ownership
-        require!(nft_info.owner == ctx.accounts.signer.key(), UniversalNFTError::NotOwner);
+        // Verify caller authentication (in production, this would verify Gateway program)
+        let current_ix = instructions::get_instruction_relative(0, &ctx.accounts.instruction_sysvar)?;
+        msg!("Current instruction program ID: {}", current_ix.program_id);
+        
+        let nft_info = &mut ctx.accounts.nft_info;
+        
+        // Verify NFT exists and is owned by correct owner
+        if nft_info.owner != *ctx.accounts.signer.key {
+            return Err(ErrorCode::NotOwner.into());
+        }
+        
+        // Ensure NFT is not already burned
         require!(!nft_info.is_burned, UniversalNFTError::AlreadyBurned);
-
-        // Create cross-chain transfer data
-        let transfer_data = CrossChainNFTTransfer {
+        
+        // Prepare cross-chain message for ZetaChain
+        let message_data = CrossChainMessage {
+            message_type: MessageType::Mint,
             token_id,
-            name: nft_info.name.clone(),
-            symbol: nft_info.symbol.clone(),
-            uri: nft_info.uri.clone(),
-            receiver: ctx.accounts.signer.key(), // Use sender's key as placeholder
-            source_chain: b"solana".to_vec(),
+            recipient_address,
+            metadata_uri: metadata_uri.clone(),
         };
-
-        // Encode transfer data for cross-chain message
-        let encoded_data = transfer_data.try_to_vec().map_err(|_| ErrorCode::SerializationError)?;
-
-        // Create instruction data for ZetaChain Gateway call
-        // This follows the pattern from the ZetaChain documentation
-        let gateway_instruction_data = GatewayCallInstruction {
-            receiver: destination_receiver,
-            message: encoded_data,
-            revert_options: Some(RevertOptions {
-                revert_address: ctx.accounts.signer.key(),
-                abort_address: destination_receiver, // Use destination as abort address
-                call_on_revert: true,
-                revert_message: b"NFT transfer failed".to_vec(),
-                on_revert_gas_limit: gas_amount,
-            }),
-        };
-
-        // Serialize the instruction data
-        let instruction_data = gateway_instruction_data.try_to_vec()
+        
+        let serialized_message = message_data.try_to_vec()
             .map_err(|_| ErrorCode::SerializationError)?;
-
-        // Create instruction to call ZetaChain Gateway
-        let gateway_instruction = Instruction {
-            program_id: ctx.accounts.gateway_program.key(),
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.signer.key(), true),
-                AccountMeta::new(ctx.accounts.gateway_pda.key(), false),
-                AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
-            ],
-            data: instruction_data,
-        };
-
-        // Execute the cross-chain call via CPI
-        invoke(
-            &gateway_instruction,
-            &[
-                ctx.accounts.signer.to_account_info(),
-                ctx.accounts.gateway_pda.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-        )?;
-
-        // Burn the NFT locally after successful gateway call
-        let burn_cpi_accounts = Burn {
-            mint: ctx.accounts.mint.to_account_info(),
-            from: ctx.accounts.token_account.to_account_info(),
+        
+        msg!("Serialized cross-chain message: {} bytes", serialized_message.len());
+        
+        // Burn the NFT on source chain first
+        let token_account = &ctx.accounts.token_account;
+        let mint_account = &ctx.accounts.mint;
+        
+        // Burn token using token program
+        let cpi_accounts = token::Burn {
+            mint: mint_account.to_account_info(),
+            from: token_account.to_account_info(),
             authority: ctx.accounts.signer.to_account_info(),
         };
-        let burn_cpi_program = ctx.accounts.token_program.to_account_info();
-        let burn_cpi_ctx = CpiContext::new(burn_cpi_program, burn_cpi_accounts);
-        burn(burn_cpi_ctx, 1)?;
-
-        // Mark NFT as burned in our state
-        let nft_info = &mut ctx.accounts.nft_info;
+        
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        
+        token::burn(cpi_ctx, 1)?;
+        msg!("NFT burned successfully on source chain");
+        
+        // Update NFT state to indicate cross-chain transfer
         nft_info.is_burned = true;
-
+        nft_info.cross_chain_data = Some(CrossChainData {
+            destination_chain_id,
+            recipient_address,
+            transfer_timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        // Create CPI context for Gateway deposit call
+        let gateway_cpi_accounts = gateway::cpi::accounts::DepositSplToken {
+            signer: ctx.accounts.signer.to_account_info(),
+            pda: ctx.accounts.gateway_pda.to_account_info(),
+            whitelist_entry: ctx.accounts.whitelist_entry.to_account_info(),
+            mint_account: ctx.accounts.mint.to_account_info(),
+            token_program: ctx.accounts.token_program.to_account_info(),
+            from: ctx.accounts.token_account.to_account_info(),
+            to: ctx.accounts.gateway_token_account.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+        };
+        
+        let gateway_cpi_ctx = CpiContext::new(
+            ctx.accounts.gateway_program.to_account_info(),
+            gateway_cpi_accounts,
+        );
+        
+        // Create revert options for cross-chain call
+        let revert_options = Some(RevertOptions {
+            revert_address: ctx.accounts.signer.key(),
+            call_on_revert: true,
+            abort_address: recipient_address,
+            revert_message: b"NFT transfer failed".to_vec(),
+            on_revert_gas_limit: 100000,
+        });
+        
+        // Call Gateway deposit_spl_token_and_call for cross-chain transfer
+        gateway::cpi::deposit_spl_token_and_call(
+            gateway_cpi_ctx,
+            1, // amount (1 NFT)
+            recipient_address,
+            serialized_message.clone(),
+            revert_options,
+        )?;
+        
+        msg!("Gateway CPI call executed successfully");
+        msg!("Amount: 1 NFT token");
+        msg!("Recipient: {:?}", recipient_address);
+        msg!("Message size: {} bytes", serialized_message.len());
+        
+        // Emit cross-chain transfer event
         emit!(CrossChainTransferEvent {
             token_id,
-            from_chain: "solana".to_string(),
-            to_chain: destination_chain,
-            sender: ctx.accounts.signer.key(),
-            receiver: destination_receiver,
+            from_chain: "Solana".to_string(),
+            to_chain: format!("Chain-{}", destination_chain_id),
+            sender: *ctx.accounts.signer.key,
+            receiver: recipient_address,
         });
-
+        
+        msg!("NFT transferred cross-chain successfully via Gateway pattern");
+        msg!("Token ID: {}, Destination Chain: {}", token_id, destination_chain_id);
+        msg!("Recipient Address: {:?}", recipient_address);
+        
         Ok(())
     }
 
+// Cross-chain message types and data structures
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub enum MessageType {
+    Mint,
+    Burn,
+    Transfer,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct CrossChainMessage {
+    pub message_type: MessageType,
+    pub token_id: u64,
+    pub recipient_address: [u8; 20],
+    pub metadata_uri: String,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct CrossChainData {
+    pub destination_chain_id: u64,
+    pub recipient_address: [u8; 20],
+    pub transfer_timestamp: i64,
+}
+
 // ZetaChain Gateway integration structs
-#[derive(BorshSerialize, BorshDeserialize)]
+#[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct GatewayCallInstruction {
     pub receiver: [u8; 20],
     pub message: Vec<u8>,
     pub revert_options: Option<RevertOptions>,
-}
-
-// Official ZetaChain RevertOptions struct from documentation
-#[derive(BorshSerialize, BorshDeserialize)]
-pub struct RevertOptions {
-    pub revert_address: Pubkey,
-    pub abort_address: [u8; 20],
-    pub call_on_revert: bool,
-    pub revert_message: Vec<u8>,
-    pub on_revert_gas_limit: u64,
 }
 
 // Account contexts
@@ -529,6 +488,7 @@ pub struct TransferCrossChain<'info> {
     pub signer: Signer<'info>,
 
     #[account(
+        mut,
         seeds = [b"nft_info", token_id.to_le_bytes().as_ref()],
         bump
     )]
@@ -544,11 +504,22 @@ pub struct TransferCrossChain<'info> {
     #[account(mut)]
     pub mint: Account<'info, Mint>,
     
-    /// CHECK: ZetaChain Gateway PDA account
-    #[account(mut)]
+    /// Instructions sysvar for caller verification
+    /// CHECK: Instructions sysvar account
+    #[account(address = instructions::ID)]
+    pub instruction_sysvar: AccountInfo<'info>,
+    
+    // Gateway accounts for cross-chain transfer
+    /// CHECK: Gateway PDA account
     pub gateway_pda: AccountInfo<'info>,
-
-    /// CHECK: ZetaChain Gateway program for cross-chain transfers
+    
+    /// CHECK: Whitelist entry for the token
+    pub whitelist_entry: AccountInfo<'info>,
+    
+    /// CHECK: Gateway token account  
+    pub gateway_token_account: AccountInfo<'info>,
+    
+    /// CHECK: Gateway program
     pub gateway_program: AccountInfo<'info>,
     
     pub token_program: Program<'info, Token>,
@@ -611,6 +582,7 @@ pub struct NFTInfo {
     pub owner: Pubkey,
     pub mint: Pubkey,
     pub is_burned: bool,
+    pub cross_chain_data: Option<CrossChainData>,
 }
 
 #[account]
@@ -621,7 +593,7 @@ pub struct Pda {
 
 // Cross-chain data structures
 
-#[derive(BorshSerialize, BorshDeserialize, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct CrossChainNFTTransfer {
     pub token_id: u64,
     pub name: String,
@@ -717,4 +689,8 @@ pub enum ErrorCode {
     DecodingError,
     #[msg("Failed to serialize data")]
     SerializationError,
+    #[msg("Not the owner of the NFT")]
+    NotOwner,
+    #[msg("Invalid caller - must be called by authorized program")]
+    InvalidCaller,
 }
